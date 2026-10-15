@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -40,13 +41,14 @@ HEADERS = {
 }
 
 
-def fetch_stores():
+def fetch_stores(parts=None):
     """Return stores near LOCATION. Apple MY only exposes the pickup
     'recommendations' endpoint: a requested part appears under a store's
     partsAvailability only when it can be picked up there; otherwise Apple
     lists other models instead."""
-    q = [("mts.0", "regular"), ("location", LOCATION), ("product", PARTS[0])]
-    q += [(f"parts.{i}", p) for i, p in enumerate(PARTS)]
+    parts = parts or PARTS
+    q = [("mts.0", "regular"), ("location", LOCATION), ("product", parts[0])]
+    q += [(f"parts.{i}", p) for i, p in enumerate(parts)]
     url = f"{BASE}/pickup-message-recommendations?{urllib.parse.urlencode(q, safe='/')}"
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=20) as r:
@@ -101,27 +103,144 @@ def check_once(state, send_transition_alerts=True, update_state=True):
     return results
 
 
-def manual_check(chat_id, state, state_lock):
-    """Run an immediate check and report the current result to the requester."""
+# ---- product catalog (model / storage / colour -> part number) --------------
+CATALOG_PAGES = os.environ.get("CATALOG_PAGES", "iphone-18-pro").split(",")
+_catalog = {"at": 0, "items": []}
+
+
+def load_catalog():
+    """Scrape Apple's buy pages for every iPhone 18 variant (cached 1 hour)."""
+    if _catalog["items"] and time.time() - _catalog["at"] < 3600:
+        return _catalog["items"]
+    items = {}
+    for page in CATALOG_PAGES:
+        req = urllib.request.Request(f"{BASE}/buy-iphone/{page.strip()}", headers={**HEADERS, "Accept": "text/html"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", "replace")
+        for part, name in re.findall(
+                r'"partNumber":"([A-Z0-9]+/A)","price":\{[^}]*\},"category":"iphone","name":"([^"]+)"', html):
+            name = " ".join(name.split())  # Apple uses non-breaking spaces
+            m = re.match(r"(iPhone .+?) (\d+(?:GB|TB)) (.+)$", name)
+            if m:
+                items[part] = {"part": part, "model": m[1], "storage": m[2], "colour": m[3]}
+    if items:
+        _catalog.update(at=time.time(), items=list(items.values()))
+    return _catalog["items"]
+
+
+def _size(storage):
+    return int(storage[:-2]) * (1024 if storage.endswith("TB") else 1)
+
+
+def options(items, key):
+    vals = {i[key] for i in items}
+    return sorted(vals, key=_size) if key == "storage" else sorted(vals)
+
+
+def select(model="*", storage="*", colour="*"):
+    return [i for i in load_catalog()
+            if model in ("*", i["model"]) and storage in ("*", i["storage"])
+            and colour in ("*", i["colour"])]
+
+
+def stock_report(items):
+    """Check pickup stock for the given catalog items; return (text, any_available)."""
+    if not items:
+        return "No matching iPhone found.", False
+    stores = [s for s in fetch_stores([i["part"] for i in items])
+              if STORE_KEYWORD in s.get("storeName", "").lower()]
+    if not stores:
+        return f"No store matching '{STORE_KEYWORD}' returned.", False
+    lines, any_ok = [], False
+    for store in stores:
+        have = store.get("partsAvailability", {})
+        lines.append(f"📍 Apple {store['storeName']}")
+        for i in sorted(items, key=lambda i: (i["model"], _size(i["storage"]), i["colour"])):
+            ok = have.get(i["part"], {}).get("pickupDisplay") == "available"
+            any_ok |= ok
+            lines.append(f"{'✅' if ok else '❌'} {i['model']} {i['storage']} {i['colour']}")
+    return "\n".join(lines), any_ok
+
+
+def send_result(chat_id, items):
     try:
-        with state_lock:
-            results = check_once(state, send_transition_alerts=False, update_state=False)
-        available = [f"{store}: {title}" for store, _, title, ok in results if ok]
-        if available:
-            try:
-                telegram_sticker(IN_STOCK_STICKER, chat_id)
-            except (RuntimeError, urllib.error.URLError) as e:
-                log(f"could not send in-stock sticker: {e}")
-            telegram("YESSSSS IT'S FINALLY IN 🎉🎉🎉\n" + "\n".join(available), chat_id)
-        else:
-            try:
-                telegram_sticker(NO_STOCK_STICKER, chat_id)
-            except (RuntimeError, urllib.error.URLError) as e:
-                log(f"could not send no-stock sticker: {e}")
-            telegram("No stock yet 😢😭 I checked just now.", chat_id)
+        text, any_ok = stock_report(items)
+        try:
+            telegram_sticker(IN_STOCK_STICKER if any_ok else NO_STOCK_STICKER, chat_id)
+        except (RuntimeError, urllib.error.URLError) as e:
+            log(f"could not send sticker: {e}")
+        head = "YESSSSS IT'S IN 🎉🎉🎉" if any_ok else "No stock yet 😢😭 I checked just now."
+        telegram(f"{head}\n\n{text}", chat_id)
     except Exception as e:
         log(f"manual check error: {e}")
         telegram(f"⚠️ I couldn't check stock right now: {e}", chat_id)
+
+
+def keyboard(rows):
+    """rows: list of rows of (label, callback_data)."""
+    return json.dumps({"inline_keyboard": [
+        [{"text": t, "callback_data": d} for t, d in row] for row in rows]})
+
+
+def menu(step, model="*", storage="*"):
+    """Return (prompt, keyboard) for the next /checkstock step."""
+    def grid(pairs, per=2):
+        return [pairs[i:i + per] for i in range(0, len(pairs), per)]
+    if step == "model":
+        opts = [(m, f"m|{m}") for m in options(load_catalog(), "model")]
+        return "Which model?", keyboard(grid(opts) + [[("All models", "m|*")]])
+    if step == "storage":
+        opts = [(s, f"s|{model}|{s}") for s in options(select(model), "storage")]
+        return f"{model if model != '*' else 'All models'}: which storage?", keyboard(
+            grid(opts, 3) + [[("Any storage", f"s|{model}|*")]])
+    opts = [(c, f"c|{model}|{storage}|{c}") for c in options(select(model, storage), "colour")]
+    label = " ".join(x for x in (model if model != "*" else "", storage if storage != "*" else "") if x)
+    return f"{label or 'All models'}: which colour?", keyboard(
+        grid(opts) + [[("Any colour", f"c|{model}|{storage}|*")]])
+
+
+def parse_text_query(args):
+    """'/checkstock pro max 256gb black' -> (model, storage, colour), '*' = any."""
+    text = " ".join(args).lower()
+    items = load_catalog()
+    words = set(re.findall(r"[a-z0-9]+", text))
+    fits = [m for m in options(items, "model")
+            if (tags := m.lower().split()[2:]) and all(t in words for t in tags)]
+    model = max(fits, key=len) if fits else "*"
+    storage = next((s for s in options(items, "storage") if s.lower() in text.replace(" ", "")), "*")
+    colour = next((c for c in options(items, "colour") if c.lower() in text), "*")
+    return model, storage, colour
+
+
+def handle_command(chat_id, args):
+    if args:
+        model, storage, colour = parse_text_query(args)
+        return send_result(chat_id, select(model, storage, colour))
+    prompt, kb = menu("model")
+    telegram_api("sendMessage", {"chat_id": chat_id, "text": prompt, "reply_markup": kb})
+
+
+def handle_callback(cb):
+    chat_id = str(cb["message"]["chat"]["id"])
+    msg_id = cb["message"]["message_id"]
+    telegram_api("answerCallbackQuery", {"callback_query_id": cb["id"]})
+    kind, *rest = cb["data"].split("|")
+
+    def edit(prompt, kb=None):
+        p = {"chat_id": chat_id, "message_id": msg_id, "text": prompt}
+        if kb:
+            p["reply_markup"] = kb
+        telegram_api("editMessageText", p)
+
+    if kind == "m":
+        edit(*menu("storage", rest[0]))
+    elif kind == "s":
+        edit(*menu("colour", rest[0], rest[1]))
+    elif kind == "c":
+        model, storage, colour = rest
+        desc = " ".join(x for x in (model, storage, colour) if x != "*") or "all iPhone 18 models"
+        edit(f"Checking {desc}…")
+        send_result(chat_id, select(model, storage, colour))
 
 
 def telegram_listener(state, state_lock):
@@ -132,17 +251,24 @@ def telegram_listener(state, state_lock):
             updates = telegram_api("getUpdates", {
                 "offset": offset,
                 "timeout": min(INTERVAL, 30),
-                "allowed_updates": json.dumps(["message"]),
+                "allowed_updates": json.dumps(["message", "callback_query"]),
             }) or []
             for update in updates:
                 offset = update["update_id"] + 1
-                message = update.get("message", {})
-                chat_id = str(message.get("chat", {}).get("id", ""))
-                text = message.get("text", "").strip().split()[0].lower() if message.get("text") else ""
-                if chat_id != str(CHAT_ID):
-                    continue
-                if text.split("@", 1)[0] == "/checkstock":
-                    manual_check(chat_id, state, state_lock)
+                try:
+                    cb = update.get("callback_query")
+                    if cb:
+                        if str(cb["message"]["chat"]["id"]) == str(CHAT_ID):
+                            handle_callback(cb)
+                        continue
+                    message = update.get("message", {})
+                    if str(message.get("chat", {}).get("id", "")) != str(CHAT_ID):
+                        continue
+                    words = message.get("text", "").strip().split()
+                    if words and words[0].lower().split("@", 1)[0] == "/checkstock":
+                        handle_command(str(CHAT_ID), words[1:])
+                except Exception as e:  # one bad update shouldn't stop the listener
+                    log(f"command error: {e}")
         except Exception as e:
             log(f"Telegram command listener error: {e}")
             time.sleep(5)
