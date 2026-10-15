@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apple Store Malaysia pickup-availability notifier -> Telegram.
 
-Polls Apple's fulfillment-messages endpoint and sends a Telegram message
+Polls Apple's retail pickup-message endpoint and sends a Telegram message
 when a part becomes available for pickup at a store whose name matches
 STORE_KEYWORD (default "TRX").
 
@@ -24,8 +24,8 @@ import urllib.request
 # ---- config (override with env vars) ---------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-# Comma-separated Apple part numbers, e.g. "MXXXXPA/A". Find them on the
-# product page (see README.md).
+# Comma-separated Apple part numbers, e.g. "MJXN4X/A", or "all" to watch
+# every iPhone 18 Pro / Pro Max variant on the buy page.
 PARTS = [p.strip() for p in os.environ.get("APPLE_PARTS", "").split(",") if p.strip()]
 STORE_KEYWORD = os.environ.get("STORE_KEYWORD", "TRX").lower()
 LOCATION = os.environ.get("APPLE_LOCATION", "Kuala Lumpur")
@@ -44,7 +44,7 @@ HEADERS = {
 def fetch_stores(parts=None):
     """Return stores near LOCATION with per-part pickup availability.
     Apple caps each response at ~20 parts, so request in chunks and merge."""
-    parts = parts or PARTS
+    parts = parts or watched_parts()
     stores = {}
     for k in range(0, len(parts), 10):
         q = [("pl", "true"), ("location", LOCATION)]
@@ -82,27 +82,39 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
+def watched_parts():
+    if [p.lower() for p in PARTS] == ["all"]:
+        return [i["part"] for i in load_catalog()]
+    return PARTS
+
+
 def check_once(state, send_transition_alerts=True, update_state=True):
-    stores = [s for s in fetch_stores() if STORE_KEYWORD in s.get("storeName", "").lower()]
+    parts = watched_parts()
+    names = {i["part"]: f"{i['model']} {i['storage']} {i['colour']}" for i in _catalog["items"]}
+    stores = [s for s in fetch_stores(parts) if STORE_KEYWORD in s.get("storeName", "").lower()]
     if not stores:
         log(f"no store matching '{STORE_KEYWORD}' returned")
     results = []
     for store in stores:
-        parts = store.get("partsAvailability", {})
-        for part in PARTS:
-            info = parts.get(part)
+        have = store.get("partsAvailability", {})
+        new = []
+        for part in parts:
+            info = have.get(part)
             avail = bool(info) and info.get("pickupDisplay") == "available"
-            title = (info or {}).get("messageTypes", {}).get("regular", {}).get(
-                "storePickupProductTitle", part)
+            title = names.get(part) or (info or {}).get("messageTypes", {}).get(
+                "regular", {}).get("storePickupProductTitle", part)
             key = (store["storeNumber"], part)
             log(f"{store['storeName']} | {title} | {'AVAILABLE' if avail else 'unavailable'}")
             results.append((store["storeName"], part, title, avail))
-            if send_transition_alerts and avail and not state.get(key):
-                telegram(f"🟢 In stock for pickup at Apple {store['storeName']}!\n"
-                         f"{title}\n"
-                         f"Order now: https://www.apple.com/my/shop/buy-iphone/iphone-18-pro")
+            if avail and not state.get(key):
+                new.append(title)
             if update_state:
                 state[key] = avail
+        # One message per check, so watching many parts can't flood the chat.
+        if send_transition_alerts and new:
+            telegram(f"🟢 In stock for pickup at Apple {store['storeName']}!\n"
+                     + "\n".join(f"• {t}" for t in new)
+                     + "\nOrder now: https://www.apple.com/my/shop/buy-iphone/iphone-18-pro")
     return results
 
 
@@ -295,7 +307,7 @@ def main():
     if args.list:
         for st in fetch_stores():
             have = st.get("partsAvailability", {})
-            for part in PARTS:
+            for part in watched_parts():
                 ok = have.get(part, {}).get("pickupDisplay") == "available"
                 print(f"{st['storeName']:<24} {part}  {'available' if ok else 'unavailable'}")
         return
@@ -319,7 +331,7 @@ def main():
         target=telegram_listener, args=(state, state_lock), daemon=True
     )
     listener.start()
-    log(f"Watching {PARTS} at stores matching '{STORE_KEYWORD}' every {INTERVAL}s")
+    log(f"Watching {len(watched_parts())} part(s) at stores matching '{STORE_KEYWORD}' every {INTERVAL}s")
     while True:
         try:
             with state_lock:
