@@ -42,18 +42,21 @@ HEADERS = {
 
 
 def fetch_stores(parts=None):
-    """Return stores near LOCATION. Apple MY only exposes the pickup
-    'recommendations' endpoint: a requested part appears under a store's
-    partsAvailability only when it can be picked up there; otherwise Apple
-    lists other models instead."""
+    """Return stores near LOCATION with per-part pickup availability.
+    Apple caps each response at ~20 parts, so request in chunks and merge."""
     parts = parts or PARTS
-    q = [("mts.0", "regular"), ("location", LOCATION), ("product", parts[0])]
-    q += [(f"parts.{i}", p) for i, p in enumerate(parts)]
-    url = f"{BASE}/pickup-message-recommendations?{urllib.parse.urlencode(q, safe='/')}"
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.load(r)
-    return data["body"]["PickupMessage"]["stores"]
+    stores = {}
+    for k in range(0, len(parts), 10):
+        q = [("pl", "true"), ("location", LOCATION)]
+        q += [(f"parts.{i}", p) for i, p in enumerate(parts[k:k + 10])]
+        url = f"{BASE}/retail/pickup-message?{urllib.parse.urlencode(q, safe='/')}"
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+        for st in data["body"]["stores"]:
+            merged = stores.setdefault(st["storeNumber"], {**st, "partsAvailability": {}})
+            merged["partsAvailability"].update(st.get("partsAvailability", {}))
+    return list(stores.values())
 
 
 def telegram_api(method, params):
