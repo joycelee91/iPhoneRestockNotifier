@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,8 @@ PARTS = [p.strip() for p in os.environ.get("APPLE_PARTS", "").split(",") if p.st
 STORE_KEYWORD = os.environ.get("STORE_KEYWORD", "TRX").lower()
 LOCATION = os.environ.get("APPLE_LOCATION", "Kuala Lumpur")
 INTERVAL = int(os.environ.get("POLL_SECONDS", "60"))
+NO_STOCK_STICKER = os.environ.get("TELEGRAM_NO_STOCK_STICKER", "")
+IN_STOCK_STICKER = os.environ.get("TELEGRAM_IN_STOCK_STICKER", "")
 BASE = "https://www.apple.com/my/shop"
 
 HEADERS = {
@@ -51,21 +54,34 @@ def fetch_stores():
     return data["body"]["PickupMessage"]["stores"]
 
 
-def telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    body = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
+def telegram_api(method, params):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    body = urllib.parse.urlencode(params).encode()
     with urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=20) as r:
-        r.read()
+        data = json.load(r)
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", f"Telegram {method} failed"))
+    return data.get("result")
+
+
+def telegram(text, chat_id=CHAT_ID):
+    telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+
+
+def telegram_sticker(sticker, chat_id=CHAT_ID):
+    if sticker:
+        telegram_api("sendSticker", {"chat_id": chat_id, "sticker": sticker})
 
 
 def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
-def check_once(state):
+def check_once(state, send_transition_alerts=True, update_state=True):
     stores = [s for s in fetch_stores() if STORE_KEYWORD in s.get("storeName", "").lower()]
     if not stores:
         log(f"no store matching '{STORE_KEYWORD}' returned")
+    results = []
     for store in stores:
         parts = store.get("partsAvailability", {})
         for part in PARTS:
@@ -75,11 +91,61 @@ def check_once(state):
                 "storePickupProductTitle", part)
             key = (store["storeNumber"], part)
             log(f"{store['storeName']} | {title} | {'AVAILABLE' if avail else 'unavailable'}")
-            if avail and not state.get(key):
+            results.append((store["storeName"], part, title, avail))
+            if send_transition_alerts and avail and not state.get(key):
                 telegram(f"🟢 In stock for pickup at Apple {store['storeName']}!\n"
                          f"{title}\n"
                          f"Order now: https://www.apple.com/my/shop/buy-iphone/iphone-18-pro")
-            state[key] = avail
+            if update_state:
+                state[key] = avail
+    return results
+
+
+def manual_check(chat_id, state, state_lock):
+    """Run an immediate check and report the current result to the requester."""
+    try:
+        with state_lock:
+            results = check_once(state, send_transition_alerts=False, update_state=False)
+        available = [f"{store}: {title}" for store, _, title, ok in results if ok]
+        if available:
+            try:
+                telegram_sticker(IN_STOCK_STICKER, chat_id)
+            except (RuntimeError, urllib.error.URLError) as e:
+                log(f"could not send in-stock sticker: {e}")
+            telegram("YESSSSS IT'S FINALLY IN 🎉🎉🎉\n" + "\n".join(available), chat_id)
+        else:
+            try:
+                telegram_sticker(NO_STOCK_STICKER, chat_id)
+            except (RuntimeError, urllib.error.URLError) as e:
+                log(f"could not send no-stock sticker: {e}")
+            telegram("No stock yet 😢😭 I checked just now.", chat_id)
+    except Exception as e:
+        log(f"manual check error: {e}")
+        telegram(f"⚠️ I couldn't check stock right now: {e}", chat_id)
+
+
+def telegram_listener(state, state_lock):
+    """Listen for commands while the automatic polling loop continues."""
+    offset = 0
+    while True:
+        try:
+            updates = telegram_api("getUpdates", {
+                "offset": offset,
+                "timeout": min(INTERVAL, 30),
+                "allowed_updates": json.dumps(["message"]),
+            }) or []
+            for update in updates:
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                text = message.get("text", "").strip().split()[0].lower() if message.get("text") else ""
+                if chat_id != str(CHAT_ID):
+                    continue
+                if text.split("@", 1)[0] == "/checkstock":
+                    manual_check(chat_id, state, state_lock)
+        except Exception as e:
+            log(f"Telegram command listener error: {e}")
+            time.sleep(5)
 
 
 def main():
@@ -119,10 +185,16 @@ def main():
         return
 
     state, fails = {}, 0
+    state_lock = threading.Lock()
+    listener = threading.Thread(
+        target=telegram_listener, args=(state, state_lock), daemon=True
+    )
+    listener.start()
     log(f"Watching {PARTS} at stores matching '{STORE_KEYWORD}' every {INTERVAL}s")
     while True:
         try:
-            check_once(state)
+            with state_lock:
+                check_once(state)
             fails = 0
         except Exception as e:  # network blips, Apple rate limits, etc.
             fails += 1
